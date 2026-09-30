@@ -14,13 +14,14 @@ composer require loongs/oauth:dev-main      # Packagist; locally via a path repo
 
 ```
 src/
-  AuthorizationServer.php     authorize (code + PKCE), token (authorization_code | refresh_token | client_credentials),
+  AuthorizationServer.php     authorize (code + PKCE), token (authorization_code | refresh_token | client_credentials | registerGrant() extensions),
                               revoke (RFC 7009), introspect (RFC 7662), metadata (RFC 8414), jwks
   ResourceServer.php          bearer extraction (header / form body, never query), opaque + JWE validation, WWW-Authenticate
   ServerConfig.php            issuer, scopes, TTLs, token format (opaque | jwe), signing + encryption keys, policy switches
   Pkce.php TokenInfo.php
   Authorization/              AuthorizationRequest, AuthorizationDecision, AuthorizationHandlerInterface (host login + consent),
                               CallableAuthorizationHandler
+  Grant/                      ExtensionGrantHandler, ExtensionGrantResult (RFC 6749 §4.5 extension grants)
   Entity/                     Client, AuthorizationCode, AccessToken, RefreshToken, Consent (readonly)
   Storage/                    ClientRepositoryInterface AuthCodeRepositoryInterface AccessTokenRepositoryInterface
                               RefreshTokenRepositoryInterface TokenFamilyRepositoryInterface ConsentRepositoryInterface
@@ -33,6 +34,7 @@ src/
   Framework/                  Bridge, OAuthRoutes, BearerMiddleware (loongs/framework)
   Exception/                  OAuthException (RFC 6749 §5.2 / RFC 6750 §3), RedirectableException
   Support/                    Crypto (CSPRNG, hashing, constant-time), Scope
+tests/extension_grant_test.php  dependency-free tests of extension grants
 ```
 
 ## Quick start
@@ -82,6 +84,35 @@ On success the request carries `oauth` (TokenInfo), `oauth_user_id`, `oauth_clie
 | `refresh_token` | Issued when the client is allowed the grant. **Rotated on every use** for public clients and, by default, confidential ones too (`rotateConfidentialRefreshTokens`). Replaying a rotated token revokes the whole family. Scope may be narrowed, never widened; the original grant scope is kept. |
 | `client_credentials` | Confidential clients only; no refresh token; `sub` = client id. |
 | removed | implicit (`response_type=token` → `unsupported_response_type`), password (`unsupported_grant_type`). |
+| extension grants | RFC 6749 §4.5, opt-in: `registerGrant('urn:…', handler)`; only clients that list the grant URI may use it. See below. |
+
+### Extension grants (RFC 6749 §4.5)
+
+For first-party sign-in flows that are not an OAuth redirect — e.g. a WeChat mini program exchanging
+a `wx.login()` code for tokens of an admin account that was **bound earlier** with a password login.
+The server keeps doing everything security-relevant (client authentication, grant permission, scope
+resolution, new token family, rotating refresh tokens, reuse detection); the handler only decides
+*who* the tokens are for:
+
+```php
+use Loongs\OAuth\Grant\ExtensionGrantResult;
+
+const WECHAT = 'urn:loongs:params:oauth:grant-type:wechat-mini';
+$server->registerGrant(WECHAT, function (OAuthRequest $req, Client $client, AuthorizationServer $as): ExtensionGrantResult {
+    $openid = $wechat->code2session((string) $req->param('code', 'post'));      // your code
+    $adminId = $bindings->adminFor($openid)
+        ?? throw OAuthException::invalidGrant('Not bound: sign in with username + password first.');
+    return new ExtensionGrantResult((string) $adminId);    // scopes: request `scope` or defaults; refresh token: yes
+});
+Client::public('admin-mobile', 'Admin app', $redirects, ['admin', 'profile'], true, [WECHAT]);
+```
+
+- The grant type must be an absolute URI (a URN or URL) and not a built-in grant; `password` stays unsupported.
+- Handler: `ExtensionGrantHandler` implementation or a Closure. Throw `OAuthException` (`invalid_request`,
+  `invalid_grant`, …) to reject; the description reaches the client. A non-`ExtensionGrantResult` return is a `server_error`.
+- `ExtensionGrantResult(userId, ?scopes, refreshToken = true, extra = [])`; `extra` adds members to the token
+  response but can never override the standard ones. `grant_types_supported` in the metadata lists registered grants.
+- Tests: `php tests/extension_grant_test.php` (no dependencies) and section A5 of `smoke_oauth.php`.
 
 **Families.** A code and every token issued from it (across rotations) share a family id. A reused code,
 a replayed refresh token or a revoked refresh token revokes the family: existing rows are marked, and a
@@ -192,6 +223,8 @@ Host responsibilities: TLS everywhere (issuer must be `https://` in production),
 clickjacking headers on the login / consent pages, user authentication, rate limiting of the token endpoint.
 
 ## Development
+
+- Unit tests (no Swoole / DB): `php tests/extension_grant_test.php`.
 
 - Packagist: `server/composer.json` requires `loongs/oauth: dev-main`. Local development: `server/composer.dev.json` path repo `../composer/oauth` (symlink).
 - Smoke (local, gitignored): `php -d disable_functions= server/bin/smoke_oauth.php cli|co` — throwaway databases

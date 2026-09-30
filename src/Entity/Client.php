@@ -16,9 +16,12 @@ final readonly class Client
     public const string AUTH_POST = 'client_secret_post';
     public const string AUTH_NONE = 'none';
 
+    /** @var list<string> */
+    public const array CORE_GRANTS = ['authorization_code', 'refresh_token', 'client_credentials'];
+
     /**
      * @param list<string> $redirectUris exact-match redirect URIs (no fragment)
-     * @param list<string> $grantTypes   authorization_code | refresh_token | client_credentials
+     * @param list<string> $grantTypes   authorization_code | refresh_token | client_credentials | extension grant URIs
      * @param list<string> $scopes       scopes this client may request
      */
     public function __construct(
@@ -42,7 +45,7 @@ final readonly class Client
             self::assertRedirectUri($uri);
         }
         foreach ($grantTypes as $g) {
-            if (!in_array($g, ['authorization_code', 'refresh_token', 'client_credentials'], true)) {
+            if (!in_array($g, self::CORE_GRANTS, true) && !self::isExtensionGrantType($g)) {
                 throw new \InvalidArgumentException("Grant type [{$g}] is not supported by OAuth 2.1 / this server.");
             }
         }
@@ -70,10 +73,20 @@ final readonly class Client
     /**
      * @param list<string> $redirectUris
      * @param list<string> $scopes
+     * @param list<string> $extensionGrants extension grant type URIs this client may use (RFC 6749 §4.5)
      */
-    public static function public(string $id, string $name, array $redirectUris, array $scopes, bool $refreshTokens = true): self
+    public static function public(string $id, string $name, array $redirectUris, array $scopes, bool $refreshTokens = true, array $extensionGrants = []): self
     {
-        return new self($id, $name, null, $redirectUris, $refreshTokens ? ['authorization_code', 'refresh_token'] : ['authorization_code'], $scopes, self::AUTH_NONE, false, time());
+        $grants = $refreshTokens ? ['authorization_code', 'refresh_token'] : ['authorization_code'];
+
+        return new self($id, $name, null, $redirectUris, array_values(array_unique([...$grants, ...$extensionGrants])), $scopes, self::AUTH_NONE, false, time());
+    }
+
+    /** RFC 6749 §4.5: an extension grant type is an absolute URI (e.g. a URN) and not a built-in grant. */
+    public static function isExtensionGrantType(string $type): bool
+    {
+        return !in_array($type, self::CORE_GRANTS, true) && strlen($type) <= 200
+            && preg_match('~^[A-Za-z][A-Za-z0-9+.\-]*:[^\s#]+$~', $type) === 1;
     }
 
     public function isConfidential(): bool

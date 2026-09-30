@@ -22,13 +22,16 @@ use Loongs\OAuth\Http\OAuthResponse;
 use Loongs\OAuth\Jwt\Jwe;
 use Loongs\OAuth\Jwt\JwkSet;
 use Loongs\OAuth\Jwt\Jwt;
+use Loongs\OAuth\Grant\ExtensionGrantHandler;
+use Loongs\OAuth\Grant\ExtensionGrantResult;
 use Loongs\OAuth\Storage\Stores;
 use Loongs\OAuth\Support\Crypto;
 use Loongs\OAuth\Support\Scope;
 
 /**
  * OAuth 2.1 authorization server (draft-ietf-oauth-v2-1): authorization endpoint (code + PKCE),
- * token endpoint (authorization_code, refresh_token, client_credentials), RFC 7009 revocation,
+ * token endpoint (authorization_code, refresh_token, client_credentials, plus registered RFC 6749
+ * §4.5 extension grants), RFC 7009 revocation,
  * RFC 7662 introspection, RFC 8414 metadata, JWKS. Framework-neutral: OAuthRequest in, OAuthResponse
  * out. No implicit grant, no password grant. Access tokens: opaque (default) or encrypted JWT (JWE
  * wrapping an RFC 9068 JWS) — never a readable plaintext JWT.
@@ -38,6 +41,9 @@ final class AuthorizationServer
     public const array GRANTS = ['authorization_code', 'refresh_token', 'client_credentials'];
 
     private ?ResourceServer $resourceServer = null;
+
+    /** @var array<string, ExtensionGrantHandler|Closure> extension grant type URI → handler */
+    private array $extensionGrants = [];
 
     /** @var Closure(): int */
     private Closure $clock;
@@ -53,6 +59,33 @@ final class AuthorizationServer
     public function now(): int
     {
         return ($this->clock)();
+    }
+
+    /**
+     * Register an extension grant (RFC 6749 §4.5), e.g. `urn:example:params:oauth:grant-type:wechat`.
+     * The type must be an absolute URI and not a built-in grant; only clients listing it in their
+     * grant types may use it. $handler: ExtensionGrantHandler or
+     * Closure(OAuthRequest, Client, AuthorizationServer): ExtensionGrantResult.
+     * The server authenticates the client, resolves scopes, starts a new token family and issues the
+     * access token (+ rotating refresh token) exactly like the built-in grants.
+     */
+    public function registerGrant(string $type, ExtensionGrantHandler|Closure $handler): void
+    {
+        if (!Client::isExtensionGrantType($type)) {
+            throw new \InvalidArgumentException("Extension grant type [{$type}] must be an absolute URI (RFC 6749 §4.5) and not a built-in grant.");
+        }
+        $this->extensionGrants[$type] = $handler;
+    }
+
+    public function hasGrant(string $type): bool
+    {
+        return in_array($type, self::GRANTS, true) || isset($this->extensionGrants[$type]);
+    }
+
+    /** @return list<string> built-in + registered extension grant types */
+    public function grantTypes(): array
+    {
+        return [...self::GRANTS, ...array_keys($this->extensionGrants)];
     }
 
     public function resourceServer(): ResourceServer
@@ -256,7 +289,7 @@ final class AuthorizationServer
             if ($grant === null || $grant === '') {
                 throw OAuthException::invalidRequest('Missing grant_type.');
             }
-            if (!in_array($grant, self::GRANTS, true)) {
+            if (!$this->hasGrant($grant)) {
                 throw OAuthException::unsupportedGrantType("Grant type [{$grant}] is not supported (OAuth 2.1 removed implicit and password).");
             }
             $client = $this->authenticateClient($request);
@@ -268,6 +301,7 @@ final class AuthorizationServer
                 'authorization_code' => $this->grantAuthorizationCode($request, $client),
                 'refresh_token' => $this->grantRefreshToken($request, $client),
                 'client_credentials' => $this->grantClientCredentials($request, $client),
+                default => $this->grantExtension($grant, $request, $client),
             });
         } catch (OAuthException $e) {
             return $e->toResponse();
@@ -420,6 +454,20 @@ final class AuthorizationServer
         $scopes = $this->resolveScopes(Scope::parse($request->param('scope', 'post')), $client);
 
         return $this->issue($client, null, $scopes, Crypto::id(), false, 'client_credentials');
+    }
+
+    /** @return array<string, mixed> */
+    private function grantExtension(string $grant, OAuthRequest $request, Client $client): array
+    {
+        $handler = $this->extensionGrants[$grant];
+        $result = $handler instanceof ExtensionGrantHandler ? $handler->handle($request, $client, $this) : $handler($request, $client, $this);
+        if (!$result instanceof ExtensionGrantResult) {
+            throw OAuthException::serverError("Extension grant [{$grant}] handler did not return an ExtensionGrantResult.");
+        }
+        $scopes = $this->resolveScopes($result->scopes ?? Scope::parse($request->param('scope', 'post')), $client);
+        $out = $this->issue($client, $result->userId, $scopes, Crypto::id(), $result->refreshToken && $client->allowsGrant('refresh_token'), $grant);
+
+        return $out + $result->extra;
     }
 
     /**
@@ -619,7 +667,7 @@ final class AuthorizationServer
             'introspection_endpoint' => $this->config->endpoint('introspection'),
             'response_types_supported' => ['code'],
             'response_modes_supported' => ['query'],
-            'grant_types_supported' => self::GRANTS,
+            'grant_types_supported' => $this->grantTypes(),
             'token_endpoint_auth_methods_supported' => [Client::AUTH_BASIC, Client::AUTH_POST, Client::AUTH_NONE],
             'revocation_endpoint_auth_methods_supported' => [Client::AUTH_BASIC, Client::AUTH_POST, Client::AUTH_NONE],
             'introspection_endpoint_auth_methods_supported' => [Client::AUTH_BASIC, Client::AUTH_POST],
