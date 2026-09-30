@@ -149,9 +149,10 @@ Orm::tenant($spec, fn () => (new OrmStorage())->install());   // inside a tenant
   (case-sensitive lookups). Every value is validated as `[A-Za-z0-9_]` before it reaches DDL.
 - Idempotent: `CREATE TABLE IF NOT EXISTS`; `install()` returns `table => created (true) | already existed (false)`. It does not alter
   existing tables. The database itself must exist.
-- loongs/orm normalises connection configs and drops `prefix` / `engine`, so `OrmStorage` reads them from the source config (booted app
-  config, or the array given to `Orm::configure()`, or the tenant array / URL). A bare `ConnectionConfig` (what `Orm::tenant()` stores)
-  has no prefix: pass it explicitly there (`new OrmStorage(null, 'app_')`) or use a named connection / array.
+- `prefix` / `engine` / `charset` / `collation` are read per call through loongs/orm's public API (`Orm::config($spec)`), so they are
+  detected for named connections, arrays, URLs and inside `Orm::tenant()` scopes alike (`new OrmStorage()` in a scope with
+  `prefix => 'app_'` uses `app_oauth_*`). An explicit prefix (`new OrmStorage($spec, 'x_')`, `--prefix=`) is an optional override.
+  Requires loongs/orm with per-connection prefix support (dev-main).
 
 ## Spec compliance checklist
 

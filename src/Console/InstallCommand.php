@@ -52,19 +52,15 @@ final class InstallCommand extends Command
 
         $name = $input->getArgument('connection');
         $name = is_string($name) && $name !== '' ? $name : (string) ($db['default'] ?? 'mysql');
-        $raw = [];
-        if (!str_contains($name, '://')) {
-            $raw = $db['connections'][$name] ?? null;
-            if (!is_array($raw)) {
-                $io->error("Database connection [{$name}] is not configured in config/database.php.");
+        if (!str_contains($name, '://') && !is_array($db['connections'][$name] ?? null)) {
+            $io->error("Database connection [{$name}] is not configured in config/database.php.");
 
-                return Command::FAILURE;
-            }
+            return Command::FAILURE;
         }
-        $opt = static fn (string $k): ?string => is_string($v = $input->getOption($k)) && $v !== '' ? $v : (isset($raw[$k]) && is_scalar($raw[$k]) && $raw[$k] !== '' ? (string) $raw[$k] : null);
+        $opt = static fn (string $k): ?string => is_string($v = $input->getOption($k)) && $v !== '' ? $v : null;
         try {
-            $storage = new OrmStorage($name, $opt('prefix') ?? (str_contains($name, '://') ? null : ''), (string) $input->getOption('tables'),
-                $opt('engine'), $opt('charset'), $opt('collation'));
+            // prefix / engine / charset / collation: the connection's config (loongs/orm ConnectionConfig), options override
+            $storage = new OrmStorage($name, $opt('prefix'), (string) $input->getOption('tables'), $opt('engine'), $opt('charset'), $opt('collation'));
             if ($input->getOption('dry-run')) {
                 foreach ($storage->schema() as $ddl) {
                     $output->writeln($ddl . ";\n");

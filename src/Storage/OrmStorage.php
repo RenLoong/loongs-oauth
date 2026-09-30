@@ -11,9 +11,9 @@ use Loongs\OAuth\Entity\Consent;
 use Loongs\OAuth\Entity\RefreshToken;
 use Loongs\Orm\Connection\Connection;
 use Loongs\Orm\Connection\ConnectionConfig;
-use Loongs\Orm\Connection\ConnectionResolver;
 use Loongs\Orm\Orm;
 use Loongs\Orm\Query\Builder;
+use Loongs\Orm\Query\Expression;
 
 /**
  * loongs/orm storage (MySQL / MariaDB). Tenant-aware like every loongs/orm call:
@@ -21,16 +21,14 @@ use Loongs\Orm\Query\Builder;
  *   new OrmStorage($tenantSpec)      → that tenant (name, config array, DSN, ConnectionConfig), every call
  *   $storage->on($otherTenant)       → a copy bound to another tenant
  *
- * Table names = <connection prefix> + "oauth_" + table ("app_" + "oauth_clients"). The connection
- * prefix, engine, charset and collation are read from the connection's own config (keys prefix /
- * engine / charset / collation of a config array, a named connection in config/database.php, or
- * ?prefix=&engine=&charset=&collation= on a mysql:// URL) unless passed explicitly. install() /
- * OrmStorage::installOn() generate the DDL from those values (CREATE TABLE IF NOT EXISTS: idempotent),
- * and every query of the same storage uses the same names. No PDO is held: every statement leases a
- * pooled connection. Check-and-set operations are single atomic UPDATEs.
- *
- * Note: a ConnectionConfig object (e.g. the one Orm::tenant() stores) no longer carries prefix /
- * engine — pass them via $prefix / $engine, or use a named connection or config array.
+ * Table names = <connection prefix> + "oauth_" + table ("app_" + "oauth_clients"). The prefix,
+ * engine, charset and collation come from the connection's config through loongs/orm
+ * (Orm::config($spec)->tableOptions(): config arrays, named connections, mysql://…?prefix=, and the
+ * current Orm::tenant() scope), resolved on every call; constructor values override them.
+ * install() / OrmStorage::installOn() generate the DDL from those values (CREATE TABLE IF NOT
+ * EXISTS: idempotent), and every query uses the same names (the query builder applies the
+ * connection prefix). No PDO is held: every statement leases a pooled connection. Check-and-set
+ * operations are single atomic UPDATEs.
  */
 final readonly class OrmStorage implements StorageInterface
 {
@@ -41,11 +39,11 @@ final readonly class OrmStorage implements StorageInterface
 
     /**
      * @param string|array<string, mixed>|ConnectionConfig|null $connection
-     * @param string|null $prefix  connection table prefix (null = from the connection config, else "")
+     * @param string|null $prefix  table prefix override (null = the connection's own prefix, auto-detected)
      * @param string $tables       base prefix of the OAuth tables (after the connection prefix)
-     * @param string|null $engine  null = connection config "engine", else InnoDB
-     * @param string|null $charset null = connection config "charset", else utf8mb4
-     * @param string|null $collation null = connection config "collation", else <charset>_bin
+     * @param string|null $engine  null = the connection's engine, else InnoDB
+     * @param string|null $charset null = the connection's charset (utf8mb4 by default)
+     * @param string|null $collation null = the connection's collation, else <charset>_bin
      */
     public function __construct(
         private string|array|ConnectionConfig|null $connection = null,
@@ -149,90 +147,24 @@ final readonly class OrmStorage implements StorageInterface
     }
 
     /**
-     * Table options for this storage: explicit values, else the connection's config, else defaults.
+     * Table options for this storage: explicit values, else the connection's config (loongs/orm
+     * ConnectionConfig::tableOptions(), resolved per call — also inside Orm::tenant()), else defaults.
      *
      * @return array{prefix: string, engine: string, charset: string, collation: string}
      */
     public function options(): array
     {
-        $raw = $this->rawConfig();
-        $pick = static function (?string $explicit, string $key, ?string $default) use ($raw): ?string {
-            $v = $explicit ?? (isset($raw[$key]) && is_scalar($raw[$key]) ? (string) $raw[$key] : null);
-
-            return $v === null || $v === '' ? $default : $v;
-        };
-        $charset = (string) $pick($this->charset, 'charset', 'utf8mb4');
-        $o = ['prefix' => (string) $pick($this->prefix, 'prefix', ''), 'engine' => (string) $pick($this->engine, 'engine', 'InnoDB'),
-            'charset' => $charset, 'collation' => (string) $pick($this->collation, 'collation', $charset . '_bin')];
+        $cfg = Orm::config($this->connection);
+        $charset = $this->charset ?? $cfg->charset();
+        $o = ['prefix' => $this->prefix ?? $cfg->prefix(), 'engine' => $this->engine ?? $cfg->engine() ?? 'InnoDB',
+            'charset' => $charset, 'collation' => $this->collation ?? $cfg->collation() ?? $charset . '_bin'];
         foreach ($o as $k => $v) {
-            if (preg_match($k === 'prefix' ? '/^[A-Za-z0-9_]{0,48}$/' : '/^[A-Za-z0-9_]{1,64}$/', $v) !== 1) {
-                throw new \InvalidArgumentException("Invalid table {$k} [{$v}] in the connection config.");
+            if (preg_match($k === 'prefix' ? '/^[A-Za-z0-9_]{0,64}$/' : '/^[A-Za-z0-9_]{1,64}$/', $v) !== 1) {
+                throw new \InvalidArgumentException("Invalid table {$k} [{$v}].");
             }
         }
 
         return $o;
-    }
-
-    /** @return array<string, mixed> the un-normalised config of this storage's connection (prefix / engine live only there) */
-    private function rawConfig(): array
-    {
-        $spec = $this->connection ?? Orm::currentTenant() ?? Orm::resolver()->defaultName();
-        if (is_array($spec)) {
-            if (isset($spec['url']) && is_string($spec['url'])) {
-                return array_replace(self::urlOptions($spec['url']), array_diff_key($spec, ['url' => 1]));
-            }
-
-            return $spec;
-        }
-        if ($spec instanceof ConnectionConfig) {
-            return $spec->isNamed() ? (self::namedConfig((string) $spec->name) ?? $spec->config) : $spec->config;
-        }
-        if (str_contains($spec, '://')) {
-            return self::urlOptions($spec);
-        }
-        if (preg_match('/^[a-z0-9_]+:[a-z_]+=/i', $spec) === 1) {
-            return Orm::resolver()->spec($spec)->config;
-        }
-
-        return self::namedConfig($spec) ?? Orm::resolver()->spec($spec)->config;
-    }
-
-    /**
-     * Raw config entry of a named connection: the booted app's config/database.php, else the array
-     * given to Orm::configure(). (loongs/orm normalises connection configs and drops keys it does not
-     * use, such as prefix / engine, so they are read from the source config here.)
-     *
-     * @return array<string, mixed>|null
-     */
-    private static function namedConfig(string $name): ?array
-    {
-        $app = $GLOBALS['__loongs_app'] ?? null;
-        if (is_object($app) && method_exists($app, 'config')) {
-            try {
-                $c = $app->config()->get('database.connections.' . $name);
-                if (is_array($c)) {
-                    return $c;
-                }
-            } catch (\Throwable) {
-            }
-        }
-        try {
-            $db = (new \ReflectionProperty(ConnectionResolver::class, 'database'))->getValue(Orm::resolver());
-            $db = $db instanceof \Closure ? $db() : $db;
-            $c = is_array($db) ? ($db['connections'][$name] ?? null) : null;
-
-            return is_array($c) ? $c : null;
-        } catch (\Throwable) {
-            return null;
-        }
-    }
-
-    /** @return array<string, string> */
-    private static function urlOptions(string $url): array
-    {
-        parse_str((string) parse_url($url, PHP_URL_QUERY), $q);
-
-        return array_filter(array_intersect_key($q, ['prefix' => 1, 'engine' => 1, 'charset' => 1, 'collation' => 1]), 'is_string');
     }
 
     private function db(): Connection
@@ -242,7 +174,13 @@ final readonly class OrmStorage implements StorageInterface
 
     private function t(string $table): Builder
     {
-        return $this->db()->table($this->table($table));
+        $c = $this->db();
+        $logical = $this->tables . $table;
+
+        // the query builder prefixes with the connection's own prefix; an explicit, different override is passed verbatim
+        return $this->prefix === null || $this->prefix === $c->prefix()
+            ? $c->table($logical)
+            : $c->table(new Expression($c->getGrammar()->wrapValue($this->prefix . $logical)));
     }
 
     /** @return list<string> */
