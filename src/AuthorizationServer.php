@@ -19,6 +19,7 @@ use Loongs\OAuth\Exception\OAuthException;
 use Loongs\OAuth\Exception\RedirectableException;
 use Loongs\OAuth\Http\OAuthRequest;
 use Loongs\OAuth\Http\OAuthResponse;
+use Loongs\OAuth\Jwt\Jwe;
 use Loongs\OAuth\Jwt\JwkSet;
 use Loongs\OAuth\Jwt\Jwt;
 use Loongs\OAuth\Storage\Stores;
@@ -29,7 +30,8 @@ use Loongs\OAuth\Support\Scope;
  * OAuth 2.1 authorization server (draft-ietf-oauth-v2-1): authorization endpoint (code + PKCE),
  * token endpoint (authorization_code, refresh_token, client_credentials), RFC 7009 revocation,
  * RFC 7662 introspection, RFC 8414 metadata, JWKS. Framework-neutral: OAuthRequest in, OAuthResponse
- * out. No implicit grant, no password grant.
+ * out. No implicit grant, no password grant. Access tokens: opaque (default) or encrypted JWT (JWE
+ * wrapping an RFC 9068 JWS) — never a readable plaintext JWT.
  */
 final class AuthorizationServer
 {
@@ -449,14 +451,16 @@ final class AuthorizationServer
         $now = $this->now();
         $exp = $now + $this->config->accessTokenTtl;
         $jti = Crypto::id();
-        if ($this->config->accessTokenFormat === ServerConfig::FORMAT_JWT) {
+        if ($this->config->accessTokenFormat === ServerConfig::FORMAT_JWE) {
             $key = $this->config->signingKey ?? throw OAuthException::serverError('No signing key.');
+            $enc = $this->config->encryptionKey ?? throw OAuthException::serverError('No encryption key.');
             $claims = ['iss' => $this->config->issuer, 'exp' => $exp, 'aud' => $this->config->audience(), 'sub' => $userId ?? $client->id,
                 'client_id' => $client->id, 'iat' => $now, 'jti' => $jti, 'scope' => Scope::format($scopes)];
             if ($grant === 'client_credentials') {
                 $claims['gty'] = 'client_credentials';
             }
-            $access = Jwt::encode($claims, $key, ['typ' => 'at+jwt']);
+            // nested JWT (RFC 7519 §5.2): sign, then encrypt; cty = JWT
+            $access = Jwe::encrypt(Jwt::encode($claims, $key, ['typ' => 'at+jwt']), $enc, ['typ' => 'at+jwt', 'cty' => 'JWT']);
             $hash = ResourceServer::jtiHash($jti, $this->config->tokenPepper);
         } else {
             $access = Crypto::token(32);
@@ -524,12 +528,8 @@ final class AuthorizationServer
 
     private function findAccessTokenRecord(string $token): ?AccessToken
     {
-        if (Jwt::looksLikeJwt($token) && $this->config->verificationKeys !== []) {
-            try {
-                [, $c] = Jwt::decode($token, JwkSet::fromSigningKeys(...$this->config->verificationKeys));
-            } catch (\Throwable) {
-                return null;
-            }
+        if (str_contains($token, '.')) {
+            $c = $this->resourceServer()->decodeJwe($token);
 
             return is_string($c['jti'] ?? null) ? $this->stores->accessTokens->findAccessToken(ResourceServer::jtiHash($c['jti'], $this->config->tokenPepper)) : null;
         }
@@ -630,7 +630,7 @@ final class AuthorizationServer
             $m['scopes_supported'] = $this->config->scopes;
         }
         if ($this->config->verificationKeys !== []) {
-            $m['jwks_uri'] = $this->config->endpoint('jwks');
+            $m['jwks_uri'] = $this->config->endpoint('jwks');   // public signing keys only (never encryption keys)
         }
 
         return $m;
@@ -650,7 +650,7 @@ final class AuthorizationServer
         return '/.well-known/oauth-authorization-server' . $path;
     }
 
-    /** @return array{keys: list<array<string, mixed>>} */
+    /** Public JWS verification keys. Encryption keys (RSA private / dir secret) are never published. @return array{keys: list<array<string, mixed>>} */
     public function jwks(): array
     {
         return JwkSet::fromSigningKeys(...$this->config->verificationKeys)->toArray();

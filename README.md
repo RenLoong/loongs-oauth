@@ -7,7 +7,7 @@ interfaces). Adapters: **loongs/orm** (MySQL, one set of tables per tenant), **l
 codes / tokens), memory (tests), and **loongs/framework** (routes + bearer middleware).
 
 ```bash
-composer require loongs/oauth      # once published; locally via a path repo (see "Development")
+composer require loongs/oauth:dev-main      # Packagist; locally via a path repo (see "Development")
 ```
 
 ## Layout
@@ -16,8 +16,8 @@ composer require loongs/oauth      # once published; locally via a path repo (se
 src/
   AuthorizationServer.php     authorize (code + PKCE), token (authorization_code | refresh_token | client_credentials),
                               revoke (RFC 7009), introspect (RFC 7662), metadata (RFC 8414), jwks
-  ResourceServer.php          bearer extraction (header / form body, never query), opaque + JWT validation, WWW-Authenticate
-  ServerConfig.php            issuer, scopes, TTLs, token format, signing keys, policy switches (secure defaults)
+  ResourceServer.php          bearer extraction (header / form body, never query), opaque + JWE validation, WWW-Authenticate
+  ServerConfig.php            issuer, scopes, TTLs, token format (opaque | jwe), signing + encryption keys, policy switches
   Pkce.php TokenInfo.php
   Authorization/              AuthorizationRequest, AuthorizationDecision, AuthorizationHandlerInterface (host login + consent),
                               CallableAuthorizationHandler
@@ -26,12 +26,13 @@ src/
                               RefreshTokenRepositoryInterface TokenFamilyRepositoryInterface ConsentRepositoryInterface
                               PurgeableInterface StorageInterface Stores
                               MemoryStorage · OrmStorage (loongs/orm) · CacheTokenStorage (loongs/cache)
-  Jwt/                        Jwt (compact JWS), SigningKey (RS256 / ES256, RFC 7638 kid), JwkSet (JWKS ⇄ PEM), Der, JwtException
+  Jwt/                        Jwt (compact JWS), SigningKey (RS256 / ES256, RFC 7638 kid), JwkSet (JWKS ⇄ PEM), Der,
+                              Jwe (RFC 7516 compact, RSA-OAEP-256 | dir + A256GCM), EncryptionKey, Oaep, JwtException
+  Console/InstallCommand.php  ./loongs oauth:install [connection] (DDL from the connection config)
   Http/                       OAuthRequest, OAuthResponse
   Framework/                  Bridge, OAuthRoutes, BearerMiddleware (loongs/framework)
   Exception/                  OAuthException (RFC 6749 §5.2 / RFC 6750 §3), RedirectableException
   Support/                    Crypto (CSPRNG, hashing, constant-time), Scope
-database/mysql.sql            schema (6 tables, prefix oauth_)
 ```
 
 ## Quick start
@@ -46,7 +47,7 @@ use Loongs\OAuth\Storage\OrmStorage;
 use Loongs\OAuth\Storage\Stores;
 
 $storage = new OrmStorage($tenantConnection);        // or new OrmStorage() inside Orm::tenant(), or MemoryStorage
-$storage->install();                                 // database/mysql.sql, idempotent
+$storage->install();                                 // CREATE TABLE IF NOT EXISTS, DDL from the connection's config
 $server = new AuthorizationServer(new ServerConfig(issuer: 'https://auth.example.com', scopes: ['read', 'write'], defaultScopes: ['read']),
     Stores::of($storage));
 
@@ -94,10 +95,25 @@ of N simultaneous exchanges of one code exactly one succeeds (smoke: 8 parallel 
 - Stored as HMAC-SHA-256 (`tokenPepper`, default empty = plain SHA-256); raw values never touch storage or logs.
 - Client secrets: `password_hash()` (Argon2id, bcrypt fallback); unknown clients verify a dummy hash (no timing oracle).
 - Comparisons: `hash_equals` (PKCE) / `password_verify` (secrets).
-- JWT access tokens (`accessTokenFormat: 'jwt'`, RFC 9068): header `typ: at+jwt`, claims `iss exp aud sub client_id iat jti scope`
-  (+ `gty` for client_credentials); RS256 (≥2048-bit RSA) or ES256 (P-256) through openssl; the verifier takes the algorithm from
-  the key registered under `kid` (no `alg: none`, no HS/RS confusion, `crit` rejected); `previousKeys` keeps rotated keys in the JWKS.
-  JWTs are also stored by `jti`, so revocation and introspection work; a JWKS-only verifier cannot see revocation before `exp`.
+- Access tokens are **opaque** by default. Self-contained tokens are always **encrypted** — there is no plaintext JWT mode
+  (`accessTokenFormat: 'jwt'` is rejected):
+  `accessTokenFormat: ServerConfig::FORMAT_JWE` = a nested JWT (RFC 7519 §5.2): an RFC 9068 JWS (`typ: at+jwt`, claims
+  `iss exp aud sub client_id iat jti scope`, + `gty` for client_credentials; RS256 ≥2048-bit or ES256) encrypted as a compact
+  JWE (RFC 7516) with header `{alg, enc: A256GCM, kid, typ: at+jwt, cty: JWT}`. Key management:
+  - `EncryptionKey::generateRsa()` / `fromRsaPrivatePem()` / `fromRsaPublicPem()` → `RSA-OAEP-256` (OAEP SHA-256 / MGF1-SHA-256, implemented
+    over openssl raw RSA with a constant-time decode; the AS may hold only the public key, resource servers the private key);
+  - `EncryptionKey::direct($32bytes)` / `generateDirect()` → `dir` (shared symmetric key).
+  All openssl, no JWT library; interop-checked against python `cryptography` and the `openssl pkeyutl` CLI.
+- The resource server decrypts (key chosen by `kid` + `alg`), then verifies the inner JWS against the JWKS and the claims. Rejected:
+  plain (unencrypted) JWS / JWT even with a valid signature, `alg: none`, any `alg` other than RSA-OAEP-256 / dir, any `enc` other than
+  A256GCM, `zip` / `crit`, missing `cty: JWT`, inner `typ` ≠ `at+jwt`, tampered header / encrypted key / IV / ciphertext / tag, wrong or
+  unknown keys (an undecryptable CEK continues with a random one, so every failure ends at the GCM tag, RFC 7516 §11.5).
+- JWKS / metadata publish **public signing keys only** (`previousKeys` during rotation); encryption private keys and `dir` secrets are
+  never published (`EncryptionKey` hides key material from `print_r` / `var_dump` and refuses `serialize`). `previousEncryptionKeys`
+  keeps decrypting old tokens during an encryption-key rotation.
+- **Revocation caveat:** JWE tokens are also stored by `jti`, so revocation and introspection work at the AS and at any resource server
+  that shares the token store (`ResourceServer::fromServer()` / `$as->resourceServer()`). A resource server that only has the keys
+  (no store) accepts a revoked token until `exp` — keep `accessTokenTtl` short or share the store.
 
 ## Multi-tenancy (loongs/orm)
 
@@ -108,6 +124,34 @@ the coroutine's `Orm::tenant()` scope, `->on($other)` rebinds. Give each tenant 
 A token, code or client secret of one tenant is unknown to the others (separate tables). Mixed storage:
 `new Stores(clients: $orm, consents: $orm, codes: $cache, accessTokens: $cache, refreshTokens: $cache, families: $cache)`
 with `CacheTokenStorage` on a per-tenant Redis prefix. `purgeExpired()` from a crontab process.
+
+### Creating the tables (per database / tenant)
+
+The DDL is generated from the target connection's config, not from a static file:
+
+```php
+OrmStorage::installOn('tenant_42');                      // named connection (config/database.php)
+OrmStorage::installOn(['driver' => 'mysql', 'database' => 'tenant_42', /* … */ 'prefix' => 'app_',
+    'engine' => 'InnoDB', 'charset' => 'utf8mb4', 'collation' => 'utf8mb4_unicode_ci']);   // tenant config array
+OrmStorage::installOn('mysql://u:p@host/tenant_42?prefix=app_');
+Orm::tenant($spec, fn () => (new OrmStorage())->install());   // inside a tenant scope
+(new OrmStorage($spec))->schema();                       // dry run: table => CREATE TABLE IF NOT EXISTS …
+```
+
+```bash
+./loongs oauth:install [connection|mysql://…] [--prefix=] [--tables=oauth_] [--engine=] [--charset=] [--collation=] [--dry-run]
+# register once in server/config/console.php: 'commands' => [\Loongs\OAuth\Console\InstallCommand::class]
+```
+
+- Table name = connection `prefix` + `oauth_` + table (`app_oauth_clients`); the storage uses the same names for every query
+  (`$storage->table('clients')`). `engine` (default InnoDB), `charset` (utf8mb4) and `collation` (default `<charset>_bin`) come from the
+  same config. Whatever the table collation, identifiers (client_id, user_id) are `<charset>_bin` and hashes `ascii_bin`
+  (case-sensitive lookups). Every value is validated as `[A-Za-z0-9_]` before it reaches DDL.
+- Idempotent: `CREATE TABLE IF NOT EXISTS`; `install()` returns `table => created (true) | already existed (false)`. It does not alter
+  existing tables. The database itself must exist.
+- loongs/orm normalises connection configs and drops `prefix` / `engine`, so `OrmStorage` reads them from the source config (booted app
+  config, or the array given to `Orm::configure()`, or the tenant array / URL). A bare `ConnectionConfig` (what `Orm::tenant()` stores)
+  has no prefix: pass it explicitly there (`new OrmStorage(null, 'app_')`) or use a named connection / array.
 
 ## Spec compliance checklist
 
@@ -135,7 +179,7 @@ OAuth 2.1 = draft-ietf-oauth-v2-1 (latest draft at the time of writing); ✅ imp
 | Token revocation; refresh-token revocation revokes the grant; 200 for unknown tokens; `unsupported_token_type` | RFC 7009 | ✅ |
 | Token introspection, authenticated callers, `active:false` otherwise | RFC 7662 | ✅ |
 | Authorization server metadata at `/.well-known/oauth-authorization-server{path}` | RFC 8414 | ✅ |
-| JWT access tokens (`at+jwt`, required claims), JWKS, RS256 / ES256 | RFC 9068, RFC 7517/7518, RFC 7638 | ✅ |
+| Encrypted self-contained access tokens: RFC 9068 JWS (`at+jwt`, RS256 / ES256) nested in a JWE (RSA-OAEP-256 or dir, A256GCM, `cty: JWT`); plain JWS / `alg: none` / other alg or enc / tampering rejected; JWKS with public signing keys only | RFC 9068, RFC 7516, RFC 7518 §4.3 / §4.5 / §5.3, RFC 7519 §5.2, RFC 7517 / 7638 | ✅ |
 | CSPRNG for all secrets; hashed storage; constant-time comparison | 2.1 §7 | ✅ |
 | Consent remembered per user + client | — | ✅ (pluggable UI) |
 | DPoP / mTLS sender-constrained tokens | RFC 9449 / 8705 | ➖ |
@@ -148,7 +192,7 @@ clickjacking headers on the login / consent pages, user authentication, rate lim
 
 ## Development
 
-- Local: `server/composer.dev.json` path repo `../composer/oauth` (symlink). Not in `server/composer.json` until published.
+- Packagist: `server/composer.json` requires `loongs/oauth: dev-main`. Local development: `server/composer.dev.json` path repo `../composer/oauth` (symlink).
 - Smoke (local, gitignored): `php -d disable_functions= server/bin/smoke_oauth.php cli|co` — throwaway databases
-  `loongs_oauth_t1/t2` (dropped), Redis under a random prefix (deleted), a 4-worker Swoole test server on `127.0.0.1:19501`
+  `loongs_oauth_t1/t2/t3` (dropped; t1 prefixed `app_` + unicode_ci, t3 created by `oauth:install` from a named connection), Redis under a random prefix (deleted), a 4-worker Swoole test server on `127.0.0.1:19501`
   (framework Router + OAuthRoutes + BearerMiddleware), full flows over real HTTP, concurrency via coroutines (co) or curl_multi (cli).

@@ -11,49 +11,228 @@ use Loongs\OAuth\Entity\Consent;
 use Loongs\OAuth\Entity\RefreshToken;
 use Loongs\Orm\Connection\Connection;
 use Loongs\Orm\Connection\ConnectionConfig;
+use Loongs\Orm\Connection\ConnectionResolver;
 use Loongs\Orm\Orm;
 use Loongs\Orm\Query\Builder;
 
 /**
- * loongs/orm storage (MySQL). Tenant-aware like every loongs/orm call:
+ * loongs/orm storage (MySQL / MariaDB). Tenant-aware like every loongs/orm call:
  *   new OrmStorage()                 → the current coroutine's Orm::tenant() scope, else the default connection
  *   new OrmStorage($tenantSpec)      → that tenant (name, config array, DSN, ConnectionConfig), every call
  *   $storage->on($otherTenant)       → a copy bound to another tenant
- * Each tenant database has its own oauth_* tables (OrmStorage::install()). No PDO is held: every
- * statement leases a pooled connection. Check-and-set operations are single atomic UPDATEs.
+ *
+ * Table names = <connection prefix> + "oauth_" + table ("app_" + "oauth_clients"). The connection
+ * prefix, engine, charset and collation are read from the connection's own config (keys prefix /
+ * engine / charset / collation of a config array, a named connection in config/database.php, or
+ * ?prefix=&engine=&charset=&collation= on a mysql:// URL) unless passed explicitly. install() /
+ * OrmStorage::installOn() generate the DDL from those values (CREATE TABLE IF NOT EXISTS: idempotent),
+ * and every query of the same storage uses the same names. No PDO is held: every statement leases a
+ * pooled connection. Check-and-set operations are single atomic UPDATEs.
+ *
+ * Note: a ConnectionConfig object (e.g. the one Orm::tenant() stores) no longer carries prefix /
+ * engine — pass them via $prefix / $engine, or use a named connection or config array.
  */
 final readonly class OrmStorage implements StorageInterface
 {
-    /** @param string|array<string, mixed>|ConnectionConfig|null $connection */
+    public const string TABLES = 'oauth_';
+
+    /** @var list<string> */
+    public const array TABLE_NAMES = ['clients', 'auth_codes', 'access_tokens', 'refresh_tokens', 'token_families', 'consents'];
+
+    /**
+     * @param string|array<string, mixed>|ConnectionConfig|null $connection
+     * @param string|null $prefix  connection table prefix (null = from the connection config, else "")
+     * @param string $tables       base prefix of the OAuth tables (after the connection prefix)
+     * @param string|null $engine  null = connection config "engine", else InnoDB
+     * @param string|null $charset null = connection config "charset", else utf8mb4
+     * @param string|null $collation null = connection config "collation", else <charset>_bin
+     */
     public function __construct(
         private string|array|ConnectionConfig|null $connection = null,
-        private string $prefix = 'oauth_',
+        private ?string $prefix = null,
+        private string $tables = self::TABLES,
+        private ?string $engine = null,
+        private ?string $charset = null,
+        private ?string $collation = null,
     ) {
+        foreach ([$prefix, $tables] as $v) {
+            if ($v !== null && preg_match('/^[A-Za-z0-9_]{0,48}$/', $v) !== 1) {
+                throw new \InvalidArgumentException('Table prefixes may only contain [A-Za-z0-9_].');
+            }
+        }
     }
 
     /** @param string|array<string, mixed>|ConnectionConfig|null $connection */
     public function on(string|array|ConnectionConfig|null $connection): self
     {
-        return new self($connection, $this->prefix);
+        return new self($connection, $this->prefix, $this->tables, $this->engine, $this->charset, $this->collation);
     }
 
-    public static function schemaPath(): string
+    /**
+     * Create the OAuth tables in $connection (connection name, tenant config array, DSN / URL,
+     * ConnectionConfig) with DDL generated from that connection's config. Idempotent.
+     *
+     * @param string|array<string, mixed>|ConnectionConfig|null $connection
+     * @return array<string, bool> table name => true if created now, false if it already existed
+     */
+    public static function installOn(string|array|ConnectionConfig|null $connection, ?string $prefix = null, string $tables = self::TABLES,
+        ?string $engine = null, ?string $charset = null, ?string $collation = null): array
     {
-        return dirname(__DIR__, 2) . '/database/mysql.sql';
+        return (new self($connection, $prefix, $tables, $engine, $charset, $collation))->install();
     }
 
-    /** Create the tables (idempotent) on this storage's connection / tenant. */
-    public function install(): void
+    /**
+     * Create the tables (idempotent) on this storage's connection / tenant.
+     *
+     * @return array<string, bool> table name => true if created now, false if it already existed
+     */
+    public function install(): array
     {
-        $sql = (string) file_get_contents(self::schemaPath());
-        $sql = (string) preg_replace('/^--.*$/m', '', $sql);
-        if ($this->prefix !== 'oauth_') {
-            $sql = (string) preg_replace('/\boauth_/', $this->prefix, $sql);
-        }
+        $o = $this->options();
         $c = $this->db();
-        foreach (array_filter(array_map('trim', explode(';', $sql))) as $stmt) {
-            $c->unprepared($stmt);
+        $out = [];
+        foreach ($this->schema($o) as $table => $ddl) {
+            $exists = $c->selectOne('SELECT 1 AS x FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?', [$table]) !== null;
+            if (!$exists) {
+                $c->unprepared($ddl);
+            }
+            $out[$table] = !$exists;
         }
+
+        return $out;
+    }
+
+    /**
+     * The CREATE TABLE IF NOT EXISTS statements for this storage's connection (dry run).
+     *
+     * @param array{prefix: string, engine: string, charset: string, collation: string}|null $o
+     * @return array<string, string> table name => DDL
+     */
+    public function schema(?array $o = null): array
+    {
+        $o ??= $this->options();
+        $bin = $o['charset'] . '_bin';
+        $id = static fn (int $len): string => "VARCHAR({$len}) COLLATE {$bin}";   // identifiers: case-sensitive, whatever the table collation
+        $hash = 'CHAR(64) CHARACTER SET ascii COLLATE ascii_bin';
+        $fam = 'CHAR(32) CHARACTER SET ascii COLLATE ascii_bin';
+        $t = fn (string $name): string => $o['prefix'] . $this->tables . $name;
+        $defs = [
+            'clients' => ["client_id {$id(100)} NOT NULL PRIMARY KEY", 'name VARCHAR(191) NOT NULL', 'secret_hash VARCHAR(255) NULL',
+                'redirect_uris TEXT NOT NULL', 'grant_types VARCHAR(255) NOT NULL', 'scopes TEXT NOT NULL',
+                'token_endpoint_auth_method VARCHAR(32) NOT NULL', 'can_introspect TINYINT(1) NOT NULL DEFAULT 0', 'created_at INT UNSIGNED NOT NULL DEFAULT 0'],
+            'auth_codes' => ["code_hash {$hash} NOT NULL PRIMARY KEY", "client_id {$id(100)} NOT NULL", "user_id {$id(191)} NOT NULL", 'redirect_uri TEXT NOT NULL',
+                'redirect_uri_provided TINYINT(1) NOT NULL', 'scopes TEXT NOT NULL', 'code_challenge VARCHAR(128) NOT NULL', 'code_challenge_method VARCHAR(10) NOT NULL',
+                "family_id {$fam} NOT NULL", 'expires_at INT UNSIGNED NOT NULL', 'used_at INT UNSIGNED NULL', 'created_at INT UNSIGNED NOT NULL',
+                "KEY `{$t('auth_codes')}_expires` (expires_at)"],
+            'access_tokens' => ["token_hash {$hash} NOT NULL PRIMARY KEY", "jti {$fam} NOT NULL", "format VARCHAR(8) NOT NULL DEFAULT 'opaque'", "client_id {$id(100)} NOT NULL",
+                "user_id {$id(191)} NULL", 'scopes TEXT NOT NULL', "family_id {$fam} NOT NULL", 'issued_at INT UNSIGNED NOT NULL', 'expires_at INT UNSIGNED NOT NULL',
+                'revoked_at INT UNSIGNED NULL', "KEY `{$t('access_tokens')}_family` (family_id)", "KEY `{$t('access_tokens')}_expires` (expires_at)"],
+            'refresh_tokens' => ["token_hash {$hash} NOT NULL PRIMARY KEY", "client_id {$id(100)} NOT NULL", "user_id {$id(191)} NULL", 'scopes TEXT NOT NULL',
+                "family_id {$fam} NOT NULL", 'issued_at INT UNSIGNED NOT NULL', 'expires_at INT UNSIGNED NOT NULL', 'rotated_at INT UNSIGNED NULL', 'revoked_at INT UNSIGNED NULL',
+                "KEY `{$t('refresh_tokens')}_family` (family_id)", "KEY `{$t('refresh_tokens')}_expires` (expires_at)"],
+            'token_families' => ["family_id {$fam} NOT NULL PRIMARY KEY", 'revoked_at INT UNSIGNED NOT NULL', 'reason VARCHAR(32) NOT NULL'],
+            'consents' => ["user_id {$id(191)} NOT NULL", "client_id {$id(100)} NOT NULL", 'scopes TEXT NOT NULL', 'granted_at INT UNSIGNED NOT NULL', 'PRIMARY KEY (user_id, client_id)'],
+        ];
+        $out = [];
+        foreach ($defs as $name => $cols) {
+            $out[$t($name)] = 'CREATE TABLE IF NOT EXISTS `' . $t($name) . "` (\n  " . implode(",\n  ", $cols)
+                . "\n) ENGINE={$o['engine']} DEFAULT CHARSET={$o['charset']} COLLATE={$o['collation']}";
+        }
+
+        return $out;
+    }
+
+    /** Resolved table name, e.g. table('clients') → "app_oauth_clients". */
+    public function table(string $name): string
+    {
+        return $this->options()['prefix'] . $this->tables . $name;
+    }
+
+    /**
+     * Table options for this storage: explicit values, else the connection's config, else defaults.
+     *
+     * @return array{prefix: string, engine: string, charset: string, collation: string}
+     */
+    public function options(): array
+    {
+        $raw = $this->rawConfig();
+        $pick = static function (?string $explicit, string $key, ?string $default) use ($raw): ?string {
+            $v = $explicit ?? (isset($raw[$key]) && is_scalar($raw[$key]) ? (string) $raw[$key] : null);
+
+            return $v === null || $v === '' ? $default : $v;
+        };
+        $charset = (string) $pick($this->charset, 'charset', 'utf8mb4');
+        $o = ['prefix' => (string) $pick($this->prefix, 'prefix', ''), 'engine' => (string) $pick($this->engine, 'engine', 'InnoDB'),
+            'charset' => $charset, 'collation' => (string) $pick($this->collation, 'collation', $charset . '_bin')];
+        foreach ($o as $k => $v) {
+            if (preg_match($k === 'prefix' ? '/^[A-Za-z0-9_]{0,48}$/' : '/^[A-Za-z0-9_]{1,64}$/', $v) !== 1) {
+                throw new \InvalidArgumentException("Invalid table {$k} [{$v}] in the connection config.");
+            }
+        }
+
+        return $o;
+    }
+
+    /** @return array<string, mixed> the un-normalised config of this storage's connection (prefix / engine live only there) */
+    private function rawConfig(): array
+    {
+        $spec = $this->connection ?? Orm::currentTenant() ?? Orm::resolver()->defaultName();
+        if (is_array($spec)) {
+            if (isset($spec['url']) && is_string($spec['url'])) {
+                return array_replace(self::urlOptions($spec['url']), array_diff_key($spec, ['url' => 1]));
+            }
+
+            return $spec;
+        }
+        if ($spec instanceof ConnectionConfig) {
+            return $spec->isNamed() ? (self::namedConfig((string) $spec->name) ?? $spec->config) : $spec->config;
+        }
+        if (str_contains($spec, '://')) {
+            return self::urlOptions($spec);
+        }
+        if (preg_match('/^[a-z0-9_]+:[a-z_]+=/i', $spec) === 1) {
+            return Orm::resolver()->spec($spec)->config;
+        }
+
+        return self::namedConfig($spec) ?? Orm::resolver()->spec($spec)->config;
+    }
+
+    /**
+     * Raw config entry of a named connection: the booted app's config/database.php, else the array
+     * given to Orm::configure(). (loongs/orm normalises connection configs and drops keys it does not
+     * use, such as prefix / engine, so they are read from the source config here.)
+     *
+     * @return array<string, mixed>|null
+     */
+    private static function namedConfig(string $name): ?array
+    {
+        $app = $GLOBALS['__loongs_app'] ?? null;
+        if (is_object($app) && method_exists($app, 'config')) {
+            try {
+                $c = $app->config()->get('database.connections.' . $name);
+                if (is_array($c)) {
+                    return $c;
+                }
+            } catch (\Throwable) {
+            }
+        }
+        try {
+            $db = (new \ReflectionProperty(ConnectionResolver::class, 'database'))->getValue(Orm::resolver());
+            $db = $db instanceof \Closure ? $db() : $db;
+            $c = is_array($db) ? ($db['connections'][$name] ?? null) : null;
+
+            return is_array($c) ? $c : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /** @return array<string, string> */
+    private static function urlOptions(string $url): array
+    {
+        parse_str((string) parse_url($url, PHP_URL_QUERY), $q);
+
+        return array_filter(array_intersect_key($q, ['prefix' => 1, 'engine' => 1, 'charset' => 1, 'collation' => 1]), 'is_string');
     }
 
     private function db(): Connection
@@ -63,7 +242,7 @@ final readonly class OrmStorage implements StorageInterface
 
     private function t(string $table): Builder
     {
-        return $this->db()->table($this->prefix . $table);
+        return $this->db()->table($this->table($table));
     }
 
     /** @return list<string> */
@@ -212,7 +391,7 @@ final readonly class OrmStorage implements StorageInterface
     public function saveConsent(Consent $consent): void
     {
         $this->db()->statement(
-            'INSERT INTO `' . $this->prefix . 'consents` (user_id, client_id, scopes, granted_at) VALUES (?, ?, ?, ?) '
+            'INSERT INTO `' . $this->table('consents') . '` (user_id, client_id, scopes, granted_at) VALUES (?, ?, ?, ?) '
             . 'ON DUPLICATE KEY UPDATE scopes = VALUES(scopes), granted_at = VALUES(granted_at)',
             [$consent->userId, $consent->clientId, implode(' ', $consent->scopes), $consent->grantedAt],
         );

@@ -6,6 +6,8 @@ namespace Loongs\OAuth;
 
 use Loongs\OAuth\Exception\OAuthException;
 use Loongs\OAuth\Http\OAuthRequest;
+use Loongs\OAuth\Jwt\EncryptionKey;
+use Loongs\OAuth\Jwt\Jwe;
 use Loongs\OAuth\Jwt\JwkSet;
 use Loongs\OAuth\Jwt\Jwt;
 use Loongs\OAuth\Jwt\JwtException;
@@ -16,9 +18,11 @@ use Loongs\OAuth\Support\Scope;
 
 /**
  * Validates bearer access tokens (RFC 6750 as profiled by OAuth 2.1): Authorization header or form
- * body only — a token in the query string is rejected. Opaque tokens are looked up by hash; JWT
- * access tokens (RFC 9068) are verified against a JWKS and, when a token store is configured, also
- * checked for revocation by jti. Errors carry the WWW-Authenticate challenge.
+ * body only — a token in the query string is rejected. Opaque tokens are looked up by hash.
+ * Self-contained tokens must be encrypted: a JWE (RSA-OAEP-256 or dir, A256GCM) whose plaintext is a
+ * signed RFC 9068 JWT (RS256 / ES256) — decrypted with $decryptionKeys, signature checked with $jwks,
+ * claims validated and, when a token store is configured, checked for revocation by jti. A plain
+ * (unencrypted) JWS / JWT is always rejected. Errors carry the WWW-Authenticate challenge.
  */
 final readonly class ResourceServer
 {
@@ -27,14 +31,20 @@ final readonly class ResourceServer
         private ?AccessTokenRepositoryInterface $tokens = null,
         private ?TokenFamilyRepositoryInterface $families = null,
         private ?JwkSet $jwks = null,
+        private array $decryptionKeys = [],
         private ?string $audience = null,
         private string $tokenPepper = '',
         public string $realm = 'oauth',
         private int $leeway = 30,
         private bool $checkRevocation = true,
     ) {
-        if ($tokens === null && $jwks === null) {
-            throw new \InvalidArgumentException('A resource server needs a token store (opaque tokens) and/or a JWKS (JWT access tokens).');
+        if ($tokens === null && ($jwks === null || $decryptionKeys === [])) {
+            throw new \InvalidArgumentException('A resource server needs a token store (opaque tokens) and/or a JWKS + decryption keys (JWE access tokens).');
+        }
+        foreach ($decryptionKeys as $k) {
+            if (!$k instanceof EncryptionKey || !$k->canDecrypt()) {
+                throw new \InvalidArgumentException('decryptionKeys must be EncryptionKeys that can decrypt.');
+            }
         }
     }
 
@@ -44,7 +54,7 @@ final readonly class ResourceServer
 
         return new self($c->issuer, $as->stores->accessTokens, $as->stores->families,
             $c->verificationKeys !== [] ? JwkSet::fromSigningKeys(...$c->verificationKeys) : null,
-            $c->audience(), $c->tokenPepper, $c->realm, $c->jwtLeeway);
+            $c->decryptionKeys, $c->audience(), $c->tokenPepper, $c->realm, $c->jwtLeeway);
     }
 
     /**
@@ -89,7 +99,10 @@ final readonly class ResourceServer
     public function validate(string $token, ?int $now = null): TokenInfo
     {
         $now ??= time();
-        $info = $this->jwks !== null && Jwt::looksLikeJwt($token) ? $this->validateJwt($token, $now) : $this->validateOpaque($token, $now);
+        $info = match (true) {
+            str_contains($token, '.') => $this->validateJwe($token, $now),   // opaque tokens never contain '.'; a plain JWS is rejected there
+            default => $this->validateOpaque($token, $now),
+        };
 
         return $info ?? throw $this->error('invalid_token', 'The access token is invalid, expired or revoked.', 401);
     }
@@ -108,18 +121,41 @@ final readonly class ResourceServer
         return new TokenInfo($t->clientId, $t->userId, $t->scopes, $t->expiresAt, $t->issuedAt, $t->jti, $t->format);
     }
 
-    private function validateJwt(string $token, int $now): ?TokenInfo
+    /**
+     * Decrypt + verify an encrypted access token and return its claims, or null. Rejects plain JWS,
+     * alg none / unsupported alg or enc, tampered header / key / IV / ciphertext / tag, wrong keys,
+     * a missing or wrong cty, an inner token that is not a signed at+jwt.
+     *
+     * @return array<string, mixed>|null
+     */
+    public function decodeJwe(string $token): ?array
     {
+        if ($this->jwks === null || $this->decryptionKeys === [] || !Jwe::looksLikeJwe($token)) {
+            return null;
+        }
         try {
-            [$h, $c] = Jwt::decode($token, $this->jwks);
+            [$outer, $inner] = Jwe::decrypt($token, $this->decryptionKeys);
+            if (strtoupper((string) ($outer['cty'] ?? '')) !== 'JWT' || !Jwt::looksLikeJwt($inner)) {
+                return null;
+            }
+            [$h, $c] = Jwt::decode($inner, $this->jwks);
         } catch (JwtException) {
             return null;
         }
         $typ = strtolower((string) ($h['typ'] ?? ''));
+
+        return in_array($typ, ['at+jwt', 'application/at+jwt'], true) ? $c : null;
+    }
+
+    private function validateJwe(string $token, int $now): ?TokenInfo
+    {
+        $c = $this->decodeJwe($token);
+        if ($c === null) {
+            return null;
+        }
         $aud = $c['aud'] ?? null;
         $auds = is_array($aud) ? $aud : [$aud];
-        if (!in_array($typ, ['at+jwt', 'application/at+jwt'], true)
-            || ($c['iss'] ?? null) !== $this->issuer
+        if (($c['iss'] ?? null) !== $this->issuer
             || !in_array($this->audience ?? $this->issuer, $auds, true)
             || !is_int($c['exp'] ?? null) || $now >= $c['exp'] + $this->leeway
             || (isset($c['nbf']) && (!is_int($c['nbf']) || $now + $this->leeway < $c['nbf']))
@@ -129,7 +165,7 @@ final readonly class ResourceServer
         $userId = $c['sub'] === $c['client_id'] && ($c['gty'] ?? null) === 'client_credentials' ? null : $c['sub'];
         if ($this->tokens !== null && $this->checkRevocation) {
             $t = $this->tokens->findAccessToken(self::jtiHash($c['jti'], $this->tokenPepper));
-            if ($t === null || $t->format !== ServerConfig::FORMAT_JWT || $t->revokedAt !== null || $t->clientId !== $c['client_id']
+            if ($t === null || $t->format !== ServerConfig::FORMAT_JWE || $t->revokedAt !== null || $t->clientId !== $c['client_id']
                 || ($this->families?->isFamilyRevoked($t->familyId) ?? false)) {
                 return null;
             }
@@ -142,10 +178,10 @@ final readonly class ResourceServer
             return null;
         }
 
-        return new TokenInfo($c['client_id'], $userId, $scopes, $c['exp'], (int) ($c['iat'] ?? 0), $c['jti'], ServerConfig::FORMAT_JWT, $c);
+        return new TokenInfo($c['client_id'], $userId, $scopes, $c['exp'], (int) ($c['iat'] ?? 0), $c['jti'], ServerConfig::FORMAT_JWE, $c);
     }
 
-    /** Storage key of a JWT access token (hash of its jti, domain-separated from opaque tokens). */
+    /** Storage key of a JWE access token (hash of its jti, domain-separated from opaque tokens). */
     public static function jtiHash(string $jti, string $pepper = ''): string
     {
         return Crypto::hashToken('jti:' . $jti, $pepper);
