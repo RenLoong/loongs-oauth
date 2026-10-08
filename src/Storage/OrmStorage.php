@@ -16,15 +16,16 @@ use Loongs\Orm\Query\Builder;
 use Loongs\Orm\Query\Expression;
 
 /**
- * loongs/orm storage (MySQL / MariaDB). Tenant-aware like every loongs/orm call:
- *   new OrmStorage()                 → the current coroutine's Orm::tenant() scope, else the default connection
+ * loongs/orm storage (MySQL / MariaDB). Connection resolved per call like every loongs/orm call:
+ *   new OrmStorage()                 → the default connection: inside a loongs/saas Tenancy::run() scope the
+ *                                      current coroutine's tenant, else the configured default
  *   new OrmStorage($tenantSpec)      → that tenant (name, config array, DSN, ConnectionConfig), every call
  *   $storage->on($otherTenant)       → a copy bound to another tenant
  *
  * Table names = <connection prefix> + "oauth_" + table ("app_" + "oauth_clients"). The prefix,
  * engine, charset and collation come from the connection's config through loongs/orm
  * (Orm::config($spec)->tableOptions(): config arrays, named connections, mysql://…?prefix=, and the
- * current Orm::tenant() scope), resolved on every call; constructor values override them.
+ * current loongs/saas tenant scope), resolved on every call; constructor values override them.
  * install() / OrmStorage::installOn() generate the DDL from those values (CREATE TABLE IF NOT
  * EXISTS: idempotent), and every query uses the same names (the query builder applies the
  * connection prefix). No PDO is held: every statement leases a pooled connection. Check-and-set
@@ -148,7 +149,7 @@ final readonly class OrmStorage implements StorageInterface
 
     /**
      * Table options for this storage: explicit values, else the connection's config (loongs/orm
-     * ConnectionConfig::tableOptions(), resolved per call — also inside Orm::tenant()), else defaults.
+     * ConnectionConfig::tableOptions(), resolved per call — also inside Tenancy::run()), else defaults.
      *
      * @return array{prefix: string, engine: string, charset: string, collation: string}
      */

@@ -1,6 +1,6 @@
 {
     "name": "loongs/oauth",
-    "description": "loong-swoole OAuth 2.1 authorization server + resource server — authorization_code with PKCE (S256), client_credentials, rotating refresh tokens, RFC 7009 revocation, RFC 7662 introspection, RFC 8414 metadata, RFC 9207 iss, encrypted RFC 9068 access tokens (nested JWS-in-JWE, RFC 7516); storage-agnostic core with loongs/orm (tenant-aware), loongs/cache and memory stores",
+    "description": "loong-swoole OAuth 2.1 authorization server + resource server — authorization_code with PKCE (S256), client_credentials, rotating refresh tokens, RFC 7009 revocation, RFC 7662 introspection, RFC 8414 metadata, RFC 9207 iss, encrypted RFC 9068 access tokens (nested JWS-in-JWE, RFC 7516); storage-agnostic core with loongs/orm (multi-tenant with loongs/saas), loongs/cache and memory stores",
     "type": "library",
     "license": "MIT",
     "keywords": ["oauth", "oauth2", "oauth2.1", "pkce", "authorization-server", "resource-server", "jwt", "jwe", "swoole", "saas", "multi-tenant", "loongs"],
@@ -11,7 +11,8 @@
         "loongs/helper": "dev-main"
     },
     "suggest": {
-        "loongs/orm": "OrmStorage: MySQL storage, one set of OAuth tables per tenant (Orm::tenant / explicit connection spec); OrmStorage::installOn() / ./loongs oauth:install create them",
+        "loongs/orm": "OrmStorage: MySQL storage (explicit connection spec or the default connection); OrmStorage::installOn() / ./loongs oauth:install create the tables",
+        "loongs/saas": "One set of OAuth tables per tenant: new OrmStorage() follows the Tenancy::run() tenant scope",
         "loongs/cache": "CacheTokenStorage: authorization codes and tokens in Redis (or any loongs/cache store)",
         "loongs/framework": "BearerMiddleware (resource server), OAuthRoutes (authorization server endpoints), oauth:install console command",
         "ext-sodium": "Not required; random_bytes() (CSPRNG) is used for every secret"

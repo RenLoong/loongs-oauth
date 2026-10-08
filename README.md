@@ -3,7 +3,7 @@
 OAuth 2.1 authorization server and resource server for the loong-swoole stack (PHP 8.4, Swoole
 coroutines), following **draft-ietf-oauth-v2-1** and the RFCs it builds on. The core is
 framework-neutral and storage-agnostic (`OAuthRequest` in, `OAuthResponse` out, six repository
-interfaces). Adapters: **loongs/orm** (MySQL, one set of tables per tenant), **loongs/cache** (Redis
+interfaces). Adapters: **loongs/orm** (MySQL; one set of tables per tenant with **loongs/saas**), **loongs/cache** (Redis
 codes / tokens), memory (tests), and **loongs/framework** (routes + bearer middleware).
 
 ```bash
@@ -48,7 +48,7 @@ use Loongs\OAuth\ServerConfig;
 use Loongs\OAuth\Storage\OrmStorage;
 use Loongs\OAuth\Storage\Stores;
 
-$storage = new OrmStorage($tenantConnection);        // or new OrmStorage() inside Orm::tenant(), or MemoryStorage
+$storage = new OrmStorage($tenantConnection);        // or new OrmStorage() inside Tenancy::run() (loongs/saas), or MemoryStorage
 $storage->install();                                 // CREATE TABLE IF NOT EXISTS, DDL from the connection's config
 $server = new AuthorizationServer(new ServerConfig(issuer: 'https://auth.example.com', scopes: ['read', 'write'], defaultScopes: ['read']),
     Stores::of($storage));
@@ -146,11 +146,14 @@ of N simultaneous exchanges of one code exactly one succeeds (smoke: 8 parallel 
   that shares the token store (`ResourceServer::fromServer()` / `$as->resourceServer()`). A resource server that only has the keys
   (no store) accepts a revoked token until `exp` — keep `accessTokenTtl` short or share the store.
 
-## Multi-tenancy (loongs/orm)
+## Multi-tenancy (loongs/orm + loongs/saas)
 
 `OrmStorage` resolves its connection on every statement, like every loongs/orm call:
-`new OrmStorage($spec)` pins a tenant (name / array / DSN / ConnectionConfig), `new OrmStorage()` follows
-the coroutine's `Orm::tenant()` scope, `->on($other)` rebinds. Give each tenant its own issuer
+`new OrmStorage($spec)` pins a tenant (name / array / DSN / ConnectionConfig), `new OrmStorage()` uses the default
+connection — which inside a [`loongs/saas`](https://github.com/RenLoong/loongs-saas) `Tenancy::run()` scope is the
+current tenant (served from that tenant's pool) — and `->on($other)` rebinds. Tenant scopes are no longer part of
+loongs/orm: `Orm::tenant($spec, fn () => …)` became `Loongs\Saas\Tenancy::run($spec, fn () => …)`; nothing changed in
+this package's API. Give each tenant its own issuer
 (`https://auth.example.com/{tenant}` → metadata at `/.well-known/oauth-authorization-server/{tenant}`).
 A token, code or client secret of one tenant is unknown to the others (separate tables). Mixed storage:
 `new Stores(clients: $orm, consents: $orm, codes: $cache, accessTokens: $cache, refreshTokens: $cache, families: $cache)`
@@ -165,7 +168,7 @@ OrmStorage::installOn('tenant_42');                      // named connection (co
 OrmStorage::installOn(['driver' => 'mysql', 'database' => 'tenant_42', /* … */ 'prefix' => 'app_',
     'engine' => 'InnoDB', 'charset' => 'utf8mb4', 'collation' => 'utf8mb4_unicode_ci']);   // tenant config array
 OrmStorage::installOn('mysql://u:p@host/tenant_42?prefix=app_');
-Orm::tenant($spec, fn () => (new OrmStorage())->install());   // inside a tenant scope
+Tenancy::run($spec, fn () => (new OrmStorage())->install());  // inside a loongs/saas tenant scope
 (new OrmStorage($spec))->schema();                       // dry run: table => CREATE TABLE IF NOT EXISTS …
 ```
 
@@ -181,7 +184,7 @@ Orm::tenant($spec, fn () => (new OrmStorage())->install());   // inside a tenant
 - Idempotent: `CREATE TABLE IF NOT EXISTS`; `install()` returns `table => created (true) | already existed (false)`. It does not alter
   existing tables. The database itself must exist.
 - `prefix` / `engine` / `charset` / `collation` are read per call through loongs/orm's public API (`Orm::config($spec)`), so they are
-  detected for named connections, arrays, URLs and inside `Orm::tenant()` scopes alike (`new OrmStorage()` in a scope with
+  detected for named connections, arrays, URLs and inside loongs/saas `Tenancy::run()` scopes alike (`new OrmStorage()` in a scope with
   `prefix => 'app_'` uses `app_oauth_*`). An explicit prefix (`new OrmStorage($spec, 'x_')`, `--prefix=`) is an optional override.
   Requires loongs/orm with per-connection prefix support (dev-main).
 
