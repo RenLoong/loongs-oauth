@@ -7,6 +7,7 @@ namespace Loongs\OAuth\Console;
 use Loongs\Support\Env;
 use Loongs\OAuth\Storage\OrmStorage;
 use Loongs\Orm\Orm;
+use Loongs\Orm\Support\DatabaseEnsurer;
 use Loongs\Support\BasePath;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
@@ -68,8 +69,18 @@ final class InstallCommand extends Command
 
                 return Command::SUCCESS;
             }
+            $ensured = DatabaseEnsurer::ensureExists($name);
+            if (!$ensured['ok']) {
+                $io->error($ensured['message']);
+
+                return Command::FAILURE;
+            }
             $target = Orm::resolver()->spec($name)->describe();
             $rows = [];
+            if ($ensured['created']) {
+                $rows[] = ['database ' . $ensured['database'], 'created'];
+                $io->note($ensured['message']);
+            }
             foreach ($storage->install() as $table => $created) {
                 $rows[] = [$table, $created ? 'created' : 'exists'];
             }
