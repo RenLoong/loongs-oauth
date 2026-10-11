@@ -89,7 +89,7 @@ On success the request carries `oauth` (TokenInfo), `oauth_user_id`, `oauth_clie
 ### Extension grants (RFC 6749 §4.5)
 
 For first-party sign-in flows that are not an OAuth redirect — e.g. a WeChat mini program exchanging
-a `wx.login()` code for tokens of an admin account that was **bound earlier** with a password login.
+a `wx.login()` code for tokens of an uuims account that was **bound earlier** with a password login.
 The server keeps doing everything security-relevant (client authentication, grant permission, scope
 resolution, new token family, rotating refresh tokens, reuse detection); the handler only decides
 *who* the tokens are for:
@@ -100,11 +100,11 @@ use Loongs\OAuth\Grant\ExtensionGrantResult;
 const WECHAT = 'urn:loongs:params:oauth:grant-type:wechat-mini';
 $server->registerGrant(WECHAT, function (OAuthRequest $req, Client $client, AuthorizationServer $as): ExtensionGrantResult {
     $openid = $wechat->code2session((string) $req->param('code', 'post'));      // your code
-    $adminId = $bindings->adminFor($openid)
+    $userId = $bindings->uuimsFor($openid)
         ?? throw OAuthException::invalidGrant('Not bound: sign in with username + password first.');
-    return new ExtensionGrantResult((string) $adminId);    // scopes: request `scope` or defaults; refresh token: yes
+    return new ExtensionGrantResult((string) $userId);    // scopes: request `scope` or defaults; refresh token: yes
 });
-Client::public('admin-mobile', 'Admin app', $redirects, ['admin', 'profile'], true, [WECHAT]);
+Client::public('uuims-mobile', 'Uuims app', $redirects, ['uuims', 'profile'], true, [WECHAT]);
 ```
 
 - The grant type must be an absolute URI (a URN or URL) and not a built-in grant; `password` stays unsupported.
