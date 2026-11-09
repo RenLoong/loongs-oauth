@@ -14,7 +14,7 @@
         "loongs/orm": "OrmStorage: MySQL storage (explicit connection spec or the default connection); OrmStorage::installOn() / ./loongs oauth:install create the tables",
         "loongs/saas": "One set of OAuth tables per tenant: new OrmStorage() follows the Tenancy::run() tenant scope",
         "loongs/cache": "CacheTokenStorage: authorization codes and tokens in Redis (or any loongs/cache store)",
-        "loongs/framework": "BearerMiddleware (resource server), OAuthRoutes (authorization server endpoints), oauth:install console command",
+        "loongs/framework": "BearerMiddleware (resource server), OAuthRoutes (authorization server endpoints), oauth:install / oauth:keygen console commands",
         "ext-sodium": "Not required; random_bytes() (CSPRNG) is used for every secret"
     },
     "autoload": {

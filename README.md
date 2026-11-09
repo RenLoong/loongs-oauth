@@ -30,6 +30,8 @@ src/
   Jwt/                        Jwt (compact JWS), SigningKey (RS256 / ES256, RFC 7638 kid), JwkSet (JWKS ⇄ PEM), Der,
                               Jwe (RFC 7516 compact, RSA-OAEP-256 | dir + A256GCM), EncryptionKey, Oaep, JwtException
   Console/InstallCommand.php  ./loongs oauth:install [connection] (DDL from the connection config)
+  Console/KeygenCommand.php   ./loongs oauth:keygen jwt|sk|token|refresh_token
+  Support/Keys.php            typed CSPRNG: jwt (SigningKey), sk (sk_… secrets), token / refresh_token (short/long)
   Http/                       OAuthRequest, OAuthResponse
   Framework/                  Bridge, OAuthRoutes, BearerMiddleware (loongs/framework)
   Exception/                  OAuthException (RFC 6749 §5.2 / RFC 6750 §3), RedirectableException
@@ -122,7 +124,12 @@ of N simultaneous exchanges of one code exactly one succeeds (smoke: 8 parallel 
 
 ## Tokens and secrets
 
-- Every secret from `random_bytes()` (CSPRNG): codes / access / refresh tokens 32 bytes (base64url, 43 chars), ids 16 bytes.
+- Typed generation via `Loongs\OAuth\Support\Keys` (also `./loongs oauth:keygen <type>`):
+  - `jwt` — `SigningKey::generate` (RS256 / ES256) for nested JWE access tokens
+  - `sk` — opaque secret with `sk_` prefix (client secrets); store only `Crypto::hashSecret`
+  - `token` — short access-token material (32 bytes / 256-bit, base64url 43 chars)
+  - `refresh_token` — long refresh-token material (48 bytes / 384-bit, base64url 64 chars)
+- Authorization codes / PKCE verifiers still use `Crypto::token(32)`. Ids: 16 bytes hex.
 - Stored as HMAC-SHA-256 (`tokenPepper`, default empty = plain SHA-256); raw values never touch storage or logs.
 - Client secrets: `password_hash()` (Argon2id, bcrypt fallback); unknown clients verify a dummy hash (no timing oracle).
 - Comparisons: `hash_equals` (PKCE) / `password_verify` (secrets).

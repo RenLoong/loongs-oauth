@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Loongs\OAuth\Entity;
 
 use Loongs\OAuth\Support\Crypto;
+use Loongs\OAuth\Support\Keys;
 
 /**
  * A registered client. Confidential clients have a hashed secret and authenticate at the token
@@ -65,7 +66,7 @@ final readonly class Client
     public static function confidential(string $id, string $name, array $redirectUris, array $grantTypes, array $scopes,
         string $authMethod = self::AUTH_BASIC, bool $canIntrospect = false, ?string $secret = null): array
     {
-        $secret ??= Crypto::token(32);
+        $secret ??= Keys::sk();
 
         return [new self($id, $name, Crypto::hashSecret($secret), $redirectUris, $grantTypes, $scopes, $authMethod, $canIntrospect, time()), $secret];
     }

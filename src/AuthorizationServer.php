@@ -26,6 +26,7 @@ use Loongs\OAuth\Grant\ExtensionGrantHandler;
 use Loongs\OAuth\Grant\ExtensionGrantResult;
 use Loongs\OAuth\Storage\Stores;
 use Loongs\OAuth\Support\Crypto;
+use Loongs\OAuth\Support\Keys;
 use Loongs\OAuth\Support\Scope;
 
 /**
@@ -511,13 +512,13 @@ final class AuthorizationServer
             $access = Jwe::encrypt(Jwt::encode($claims, $key, ['typ' => 'at+jwt']), $enc, ['typ' => 'at+jwt', 'cty' => 'JWT']);
             $hash = ResourceServer::jtiHash($jti, $this->config->tokenPepper);
         } else {
-            $access = Crypto::token(32);
+            $access = Keys::token();
             $hash = Crypto::hashToken($access, $this->config->tokenPepper);
         }
         $this->stores->accessTokens->saveAccessToken(new AccessToken($hash, $jti, $client->id, $userId, $scopes, $familyId, $now, $exp, null, $this->config->accessTokenFormat));
         $out = ['access_token' => $access, 'token_type' => 'Bearer', 'expires_in' => $this->config->accessTokenTtl, 'scope' => Scope::format($scopes)];
         if ($withRefresh) {
-            $refresh = Crypto::token(32);
+            $refresh = Keys::refreshToken();
             $this->stores->refreshTokens->saveRefreshToken(new RefreshToken(Crypto::hashToken($refresh, $this->config->tokenPepper), $client->id, $userId,
                 $refreshScopes ?? $scopes, $familyId, $now, $now + $this->config->refreshTokenTtl));
             $out['refresh_token'] = $refresh;
