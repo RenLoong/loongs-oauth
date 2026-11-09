@@ -43,6 +43,8 @@ final class AuthorizationServer
 
     private ?ResourceServer $resourceServer = null;
 
+    private ?ResourceServer $localResourceServer = null;
+
     /** @var array<string, ExtensionGrantHandler|Closure> extension grant type URI → handler */
     private array $extensionGrants = [];
 
@@ -92,6 +94,18 @@ final class AuthorizationServer
     public function resourceServer(): ResourceServer
     {
         return $this->resourceServer ??= ResourceServer::fromServer($this);
+    }
+
+    /**
+     * Local (no-DB) resource server for JWE access tokens: decrypt + verify only.
+     * Issue / refresh / revoke still use this AuthorizationServer + stores.
+     *
+     * @see ResourceServer::local()
+     * @see docs/local-auth.md
+     */
+    public function localResourceServer(): ResourceServer
+    {
+        return $this->localResourceServer ??= ResourceServer::localFromServer($this);
     }
 
     // ------------------------------------------------------------------ authorization endpoint

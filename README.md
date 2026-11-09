@@ -16,7 +16,7 @@ composer require loongs/oauth:dev-main      # Packagist; locally via a path repo
 src/
   AuthorizationServer.php     authorize (code + PKCE), token (authorization_code | refresh_token | client_credentials | registerGrant() extensions),
                               revoke (RFC 7009), introspect (RFC 7662), metadata (RFC 8414), jwks
-  ResourceServer.php          bearer extraction (header / form body, never query), opaque + JWE validation, WWW-Authenticate
+  ResourceServer.php          bearer extraction (header / form body, never query), opaque + JWE validation, local() no-DB path, WWW-Authenticate
   ServerConfig.php            issuer, scopes, TTLs, token format (opaque | jwe), signing + encryption keys, policy switches
   Pkce.php TokenInfo.php
   Authorization/              AuthorizationRequest, AuthorizationDecision, AuthorizationHandlerInterface (host login + consent),
@@ -232,9 +232,21 @@ OAuth 2.1 = draft-ietf-oauth-v2-1 (latest draft at the time of writing); ✅ imp
 Host responsibilities: TLS everywhere (issuer must be `https://` in production), CSRF protection and
 clickjacking headers on the login / consent pages, user authentication, rate limiting of the token endpoint.
 
+
+## Local (no-DB) resource server (JWE)
+
+For Uuims-style unified auth where authentication must not hit MySQL after issuance:
+
+```php
+$rs = ResourceServer::local($config);           // or $as->localResourceServer()
+$info = $rs->authenticate($request);            // no token-store / DB lookup
+```
+
+`invalid_token` responses carry a structured `reason`: `expired` (client may refresh), `revoked` / `invalid` (re-login).
+See [docs/local-auth.md](docs/local-auth.md) for the security model (short TTL, refresh rotation, forced logout).
 ## Development
 
-- Unit tests (no Swoole / DB): `php tests/extension_grant_test.php`.
+- Unit tests (no Swoole / DB): `php tests/key_types_test.php`, `php tests/local_auth_test.php`.
 
 - Packagist: `server/composer.json` requires `loongs/oauth: dev-main`. Local development: `server/composer.dev.json` path repo `../composer/oauth` (symlink).
 - Smoke (local, gitignored): `php -d disable_functions= server/bin/smoke_oauth.php cli|co` — throwaway databases
